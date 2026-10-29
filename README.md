@@ -1,4 +1,13 @@
-# Titanic: aprendendo ETL com Python
+# Pipelines ETL com Python: Titanic e Brasileirão
+
+Repositório das aulas de Banco de Dados. Os dois exercícios compartilham o ambiente virtual e a conexão PostgreSQL:
+
+| Aula | Notebook | Código | Tabela |
+| --- | --- | --- | --- |
+| 1 — Titanic | [bdia_titanic.ipynb](bdia_titanic.ipynb) | [pipeline.py](pipeline.py) | `passageiros` |
+| 2 — Brasileirão | [brasileirao.ipynb](brasileirao.ipynb) | [brasileirao.py](brasileirao.py) | `jogos_brasileirao` |
+
+## Aula 1 — Titanic
 
 Este projeto transforma as anotações da aula em um exercício executável. O foco é entender a preparação dos dados: nomes em inglês, valores categóricos e informações ausentes. Não treinamos um modelo de machine learning nesta etapa.
 
@@ -86,6 +95,83 @@ Os testes verificam preservação dos dados brutos e das lacunas, traduções e 
 
 Validação local em 20/10/2026: os cinco testes passaram e o pipeline executou sobre o CSV baixado, gerando 891 linhas e 11 colunas, sem IDs duplicados. Todas as células do notebook também executaram sem erros, usando o CSV local e com a carga desativada. Ambiente: Python 3.10.6, pandas 2.3.3 e SQLAlchemy 2.0.55; `pip check` não encontrou dependências incompatíveis. A carga no PostgreSQL ainda não foi validada: o Docker não estava em execução e nenhum servidor foi configurado.
 
+## Aula 2 — Brasileirão: filtrar por time e ano
+
+A continuação baixa todas as partidas da fonte, corrige os nomes das colunas, remove técnicos e formações e seleciona jogos de um time em um ano. Abra `brasileirao.ipynb` para acompanhar cada etapa.
+
+O CSV verificado em **28/10/2026** tem **8.785 jogos, 16 colunas e datas de 2003 a 2024**. O recorte **Palmeiras, 2022** contém **38 jogos e 13 colunas**. Não esperamos 17 colunas na fonte: ao criar `ano` antes de remover outras colunas, uma tabela intermediária pode chegar a 17.
+
+```powershell
+# Baixar a fonte e executar o exemplo da aula:
+.\.venv\Scripts\python.exe brasileirao.py --time Palmeiras --ano 2022
+
+# Descobrir a grafia das equipes (mandantes e visitantes):
+.\.venv\Scripts\python.exe brasileirao.py --origem data/brasileirao_bruto.csv --listar-times
+
+# Repetir offline com outros parâmetros:
+.\.venv\Scripts\python.exe brasileirao.py --origem data/brasileirao_bruto.csv --time "Sao Paulo" --ano 2023
+```
+
+O nome do time deve corresponder à fonte, incluindo maiúsculas e acentos. `--listar-times` mostra as opções; por exemplo, a fonte usa `Sao Paulo`, `Gremio` e `Palmeiras`. Um nome desconhecido ou ano indisponível gera erro explicativo. Um time existente sem partidas no ano escolhido retorna um recorte vazio, que não é carregado no banco.
+
+Se a rede apresentar o mesmo problema de certificado descrito na aula 1, faça o download pelo PowerShell e use `--origem`:
+
+```powershell
+New-Item -ItemType Directory -Force data | Out-Null
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/adaoduque/Brasileirao_Dataset/master/campeonato-brasileiro-full.csv' -OutFile 'data/brasileirao_bruto.csv'
+.\.venv\Scripts\python.exe brasileirao.py --origem data/brasileirao_bruto.csv --time Palmeiras --ano 2022
+```
+
+### Transformações
+
+| Nome na fonte | Nome padronizado |
+| --- | --- |
+| `ID` | `id_jogo` |
+| `rodata` | `rodada` |
+| `arena` | `estadio` |
+| `mandante_Placar` | `gols_mandante` |
+| `visitante_Placar` | `gols_visitante` |
+| `mandante_Estado` | `estado_mandante` |
+| `visitante_Estado` | `estado_visitante` |
+
+Removemos `formacao_mandante`, `formacao_visitante`, `tecnico_mandante` e `tecnico_visitante`. A data é validada no formato `DD/MM/AAAA`, e `ano` é extraído com `.dt.year`. O notebook também demonstra `.str[-4:].astype(int)`, como nas anotações. Os dados brutos ficam preservados, os IDs são conferidos e o resultado é ordenado por data e ID.
+
+O filtro central combina **OU** entre mandante e visitante e **E** com o ano, sempre usando parênteses:
+
+```python
+filtro_do_time = (dados["mandante"] == TIME) | (dados["visitante"] == TIME)
+filtro_do_ano = dados["ano"] == ANO
+recorte = dados.loc[filtro_do_time & filtro_do_ano, COLUNAS_DESEJADAS]
+```
+
+**Ano civil não é temporada:** o filtro usa a data em que a partida foi disputada. A fonte tem jogos da temporada 2020 realizados em 2021. Não imponha 38 como limite: isso varia com o calendário e o formato do campeonato; em 2003 e 2004, por exemplo, uma equipe podia disputar 46 jogos. A fonte não possui uma coluna explícita de temporada, e o pipeline não tenta adivinhá-la.
+
+### Arquivos gerados e carga
+
+O script salva `data/brasileirao_bruto.csv`, `data/brasileirao_filtrado.csv` e `data/brasileirao_qualidade.json`. O CSV filtrado e o relatório representam o último filtro executado; os arquivos do Titanic têm nomes separados. Datas exportadas usam `AAAA-MM-DD`.
+
+Após configurar `.env` e iniciar o PostgreSQL:
+
+```powershell
+.\.venv\Scripts\python.exe brasileirao.py --origem data/brasileirao_bruto.csv --time Palmeiras --ano 2022 --carregar
+```
+
+A tabela `jogos_brasileirao` guarda **apenas o recorte selecionado**, com `data` do tipo SQL `DATE`, sem índice adicional do pandas. Uma tabela existente gera erro. Para trocar o recorte, acrescente `--substituir`: isso apaga e recria **somente `jogos_brasileirao`**, sem alterar `passageiros`.
+
+```sql
+SELECT COUNT(*) AS jogos, MIN(data) AS primeira_partida,
+       MAX(data) AS ultima_partida
+FROM jogos_brasileirao;
+
+SELECT mandante, visitante, gols_mandante, gols_visitante
+FROM jogos_brasileirao
+ORDER BY data, id_jogo;
+```
+
+Os testes desta aula verificam o filtro em ambas as posições, datas, preservação dos dados brutos, entradas inválidas e a escrita SQL com SQLite em memória. Esse teste de SQL não substitui a integração PostgreSQL, que depende de um servidor ativo.
+
+Validação em 28/10/2026: **12 testes passaram** (7 do Brasileirão e 5 do Titanic). Todas as células de código de `brasileirao.ipynb` executaram sem erros com o CSV local e a carga desativada. O resultado didático foi comparado ao da função reutilizável. Como verificação adicional, São Paulo em 2023 retornou 38 partidas e Palmeiras no ano civil 2021 retornou 50, reforçando a diferença entre ano e temporada. O Docker continua sem servidor ativo nesta máquina, portanto a carga PostgreSQL permanece não validada.
+
 ## Referências
 
 - [CSV fornecido na aula](https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv)
@@ -96,4 +182,9 @@ Validação local em 20/10/2026: os cinco testes passaram e o pipeline executou 
 - [Series.map](https://pandas.pydata.org/docs/reference/api/pandas.Series.map.html): valores fora do dicionário viram ausentes.
 - [DataFrame.to_sql](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_sql.html)
 
-O repositório é local; não foi publicado no GitHub. O CSV é baixado da fonte durante a execução, sem redistribuí-lo no histórico Git.
+- [Brasileirão: repositório da fonte](https://github.com/adaoduque/Brasileirao_Dataset)
+- [Brasileirão: CSV usado na aula](https://raw.githubusercontent.com/adaoduque/Brasileirao_Dataset/master/campeonato-brasileiro-full.csv)
+- [pandas.to_datetime](https://pandas.pydata.org/pandas-docs/version/2.3/reference/api/pandas.to_datetime.html)
+- [Filtros booleanos no pandas](https://pandas.pydata.org/pandas-docs/version/2.3/user_guide/indexing.html#boolean-indexing)
+
+Os CSVs são baixados das fontes durante a execução, sem redistribuí-los no histórico Git. Credenciais, ambientes virtuais e relatórios gerados também ficam fora do Git.
