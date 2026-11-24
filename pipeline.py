@@ -4,14 +4,19 @@ import argparse
 import json
 import os
 from pathlib import Path
+from urllib.request import urlopen
 
 import pandas as pd
 from dotenv import load_dotenv
+from pandas.api.types import is_integer_dtype
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL as DatabaseURL
 
 RAIZ = Path(__file__).resolve().parent
 URL = "https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv"
+URL_CSV_LAB = "http://localhost:8001/passageiros.csv"
+CHAVE = "PassengerId"
+COLUNAS_API = {"Survived", "Pclass", "Fare"}
 COLUNAS = {
     "PassengerId": "id_passageiro", "Survived": "sobreviveu",
     "Pclass": "classe", "Name": "nome", "Sex": "sexo", "Age": "idade",
@@ -27,6 +32,52 @@ def extrair(origem=URL):
     dados = pd.read_csv(origem)
     print(f"Chegaram {len(dados)} passageiros.")
     return dados
+
+
+def extrair_api(url):
+    """Consulta a coleção de passageiros e lê a lista de objetos JSON."""
+    with urlopen(url, timeout=10) as resposta:
+        registros = json.load(resposta)
+    if not isinstance(registros, list) or any(not isinstance(item, dict) for item in registros):
+        raise ValueError("A API deve retornar uma lista JSON de passageiros.")
+    dados = pd.DataFrame(registros)
+    print(f"API: chegaram {len(dados)} passageiros.")
+    return dados
+
+
+def integrar_fontes(dados_csv, dados_api):
+    """Faz o INNER JOIN com cobertura integral e uma linha por passageiro."""
+    fontes = []
+    for fonte, dados in (("CSV", dados_csv), ("API", dados_api)):
+        if CHAVE not in dados:
+            raise ValueError(f"{fonte}: coluna {CHAVE} ausente.")
+        ids = pd.to_numeric(dados[CHAVE], errors="coerce")
+        if ids.empty or ids.isna().any() or not is_integer_dtype(ids):
+            raise ValueError(f"{fonte}: {CHAVE} deve conter identificadores inteiros preenchidos.")
+        if not ids.is_unique:
+            raise ValueError(f"{fonte}: identificadores duplicados em {CHAVE}.")
+        fontes.append(dados.assign(**{CHAVE: ids}))
+
+    csv, api = fontes
+    faltantes = COLUNAS_API - set(api.columns)
+    if faltantes:
+        raise ValueError(f"API: colunas obrigatórias ausentes: {sorted(faltantes)}.")
+    sobrepostas = (set(csv.columns) & set(api.columns)) - {CHAVE}
+    if sobrepostas:
+        raise ValueError(f"CSV e API têm colunas em comum além da chave: {sorted(sobrepostas)}.")
+
+    ids_csv, ids_api = set(csv[CHAVE]), set(api[CHAVE])
+    if ids_csv != ids_api:
+        raise ValueError(
+            f"Identificadores sem correspondência: {len(ids_csv - ids_api)} só no CSV "
+            f"e {len(ids_api - ids_csv)} só na API."
+        )
+    return csv.merge(api, how="inner", on=CHAVE, validate="one_to_one")
+
+
+def extrair_titanic(origem=None, url_api=None):
+    dados = extrair(origem or (URL_CSV_LAB if url_api else URL))
+    return integrar_fontes(dados, extrair_api(url_api)) if url_api else dados
 
 
 def transformar(dados):
@@ -89,14 +140,18 @@ def carregar(dados, engine, substituir=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--origem", default=URL, help="URL ou caminho de CSV")
+    parser.add_argument("--origem", help="URL ou caminho de CSV")
+    parser.add_argument("--api", metavar="URL", help="URL da coleção de passageiros (opcional)")
     parser.add_argument("--carregar", action="store_true", help="Gravar no PostgreSQL")
     parser.add_argument("--substituir", action="store_true", help="Substituir a tabela passageiros")
     args = parser.parse_args()
     if args.substituir and not args.carregar:
         parser.error("--substituir exige --carregar")
-    brutos = extrair(args.origem)
-    limpos = transformar(brutos)
+    try:
+        brutos = extrair_titanic(args.origem, args.api)
+        limpos = transformar(brutos)
+    except (OSError, ValueError) as erro:
+        parser.error(str(erro))
     destino = RAIZ / "data"
     destino.mkdir(exist_ok=True)
     brutos.to_csv(destino / "titanic_bruto.csv", index=False)

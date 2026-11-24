@@ -3,7 +3,7 @@ import unittest
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
-from pipeline import COLUNAS, qualidade, transformar
+from pipeline import COLUNAS, integrar_fontes, qualidade, transformar
 
 
 class TransformacaoTest(unittest.TestCase):
@@ -45,6 +45,33 @@ class TransformacaoTest(unittest.TestCase):
         self.brutos.loc[0, "Survived"] = 2
         with self.assertRaisesRegex(ValueError, "0 ou 1"):
             transformar(self.brutos)
+
+    def test_integra_por_id_com_api_fora_de_ordem(self):
+        campos_api = ["PassengerId", "Survived", "Pclass", "Fare"]
+        csv = self.brutos.drop(columns=campos_api[1:])
+        api = self.brutos[campos_api].iloc[::-1].assign(PassengerId=["2", "1"])
+
+        integrados = integrar_fontes(csv, api)
+        assert_frame_equal(integrados[self.brutos.columns], self.brutos)
+        self.assertEqual(api["PassengerId"].tolist(), ["2", "1"])
+        self.assertEqual(transformar(integrados)["sobreviveu"].tolist(), [0, 1])
+
+    def test_rejeita_fontes_com_chaves_invalidas_ou_sem_correspondencia(self):
+        campos_api = ["PassengerId", "Survived", "Pclass", "Fare"]
+        csv = self.brutos.drop(columns=campos_api[1:])
+        api = self.brutos[campos_api]
+        for ids, mensagem in (
+            ([1, None], "inteiros preenchidos"),
+            ([1, 2.5], "inteiros preenchidos"),
+            ([1, "01"], "duplicados"),
+            ([1, 3], "sem correspondência"),
+        ):
+            with self.subTest(ids=ids), self.assertRaisesRegex(ValueError, mensagem):
+                integrar_fontes(csv, api.assign(PassengerId=ids))
+        with self.assertRaisesRegex(ValueError, "PassengerId ausente"):
+            integrar_fontes(csv.drop(columns="PassengerId"), api)
+        with self.assertRaisesRegex(ValueError, "Survived"):
+            integrar_fontes(csv, api.drop(columns="Survived"))
 
 
 if __name__ == "__main__":

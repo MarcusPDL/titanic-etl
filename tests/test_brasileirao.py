@@ -2,7 +2,8 @@ import unittest
 
 import pandas as pd
 from pandas.testing import assert_frame_equal
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import Date, create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from brasileirao import APAGAR, COLUNAS_DESEJADAS, carregar, listar_times, transformar
 
@@ -68,21 +69,54 @@ class BrasileiraoTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "obrigatórias"):
             transformar(self.brutos.drop(columns=["arena"]), "Palmeiras", 2022)
 
-    def test_carga_grava_recorte_sem_indice_e_protege_tabela_existente(self):
+    def test_carga_acumula_recortes_e_atualiza_partidas_sem_duplicar(self):
         # SQLite valida o contrato SQL local, não substitui integração PostgreSQL.
         engine = create_engine("sqlite://")
         self.addCleanup(engine.dispose)
         dados = transformar(self.brutos, "Palmeiras", 2022)
         self.assertEqual(carregar(dados, engine), 2)
+        self.assertEqual(carregar(dados, engine), 2)
         self.assertEqual(
             [c["name"] for c in inspect(engine).get_columns("jogos_brasileirao")],
             COLUNAS_DESEJADAS,
         )
-        with self.assertRaises(ValueError):
-            carregar(dados.iloc[:1], engine)
+        self.assertEqual(
+            inspect(engine).get_pk_constraint("jogos_brasileirao")["constrained_columns"],
+            ["id_jogo"],
+        )
+
+        santos = transformar(self.brutos, "Santos", 2022)
+        santos.loc[santos["id_jogo"] == 1, ["estadio", "gols_mandante"]] = [None, 2]
+        self.assertEqual(carregar(santos, engine), 3)
         with engine.connect() as conexao:
-            self.assertEqual(conexao.execute(text("SELECT COUNT(*) FROM jogos_brasileirao")).scalar_one(), 2)
-            self.assertEqual(conexao.execute(text("SELECT data FROM jogos_brasileirao ORDER BY data LIMIT 1")).scalar_one(), "2022-04-10")
+            jogos = conexao.execute(text(
+                "SELECT id_jogo, data, estadio, gols_mandante FROM jogos_brasileirao ORDER BY id_jogo"
+            )).all()
+            self.assertEqual([jogo.id_jogo for jogo in jogos], [1, 2, 3])
+            self.assertEqual(jogos[0], (1, "2022-04-10", None, 2))
+
+        # Uma falha na substituição deve reverter também a exclusão anterior.
+        invalido = dados.assign(mandante=None)
+        with self.assertRaises(IntegrityError):
+            carregar(invalido, engine, substituir=True)
+        with engine.connect() as conexao:
+            self.assertEqual(conexao.scalar(text("SELECT COUNT(*) FROM jogos_brasileirao")), 3)
+
         self.assertEqual(carregar(dados.iloc[:1], engine, substituir=True), 1)
+        with engine.connect() as conexao:
+            self.assertEqual(conexao.scalar(text("SELECT COUNT(*) FROM jogos_brasileirao")), 1)
         with self.assertRaisesRegex(ValueError, "nenhuma carga"):
             carregar(dados.iloc[:0], engine)
+
+    def test_carga_preserva_partidas_da_tabela_criada_com_pandas(self):
+        engine = create_engine("sqlite://")
+        self.addCleanup(engine.dispose)
+        dados = transformar(self.brutos, "Palmeiras", 2022)
+        dados.to_sql("jogos_brasileirao", engine, index=False, dtype={"data": Date()})
+
+        novo_recorte = transformar(self.brutos, "Palmeiras", 2021)
+        self.assertEqual(carregar(novo_recorte, engine), 1)
+        self.assertEqual(carregar(novo_recorte, engine), 1)
+        with engine.connect() as conexao:
+            ids = conexao.scalars(text("SELECT id_jogo FROM jogos_brasileirao ORDER BY id_jogo"))
+            self.assertEqual(ids.all(), [1, 3, 4])

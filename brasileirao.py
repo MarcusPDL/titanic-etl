@@ -5,7 +5,10 @@ import json
 from numbers import Integral
 
 import pandas as pd
-from sqlalchemy import Date, text
+from sqlalchemy import BigInteger, Column, Date, Integer, MetaData, Table, Text
+from sqlalchemy import func, inspect, select, text
+from sqlalchemy.dialects.postgresql import insert as inserir_postgresql
+from sqlalchemy.dialects.sqlite import insert as inserir_sqlite
 
 from pipeline import RAIZ, criar_engine
 
@@ -31,6 +34,23 @@ COLUNAS_DESEJADAS = [
     "gols_mandante", "gols_visitante", "vencedor", "estadio",
     "estado_mandante", "estado_visitante",
 ]
+JOGOS = Table(
+    "jogos_brasileirao",
+    MetaData(),
+    Column("id_jogo", BigInteger, primary_key=True, autoincrement=False),
+    Column("rodada", BigInteger, nullable=False),
+    Column("data", Date, nullable=False),
+    Column("hora", Text),
+    Column("ano", Integer, nullable=False),
+    Column("mandante", Text, nullable=False),
+    Column("visitante", Text, nullable=False),
+    Column("gols_mandante", BigInteger, nullable=False),
+    Column("gols_visitante", BigInteger, nullable=False),
+    Column("vencedor", Text),
+    Column("estadio", Text),
+    Column("estado_mandante", Text),
+    Column("estado_visitante", Text),
+)
 
 
 def extrair(origem=URL):
@@ -101,19 +121,62 @@ def qualidade(dados):
     }
 
 
+def preparar_tabela(conexao):
+    postgresql = conexao.dialect.name == "postgresql"
+    if postgresql:
+        # Serializa criação e migração quando duas cargas começam juntas.
+        conexao.execute(text("SELECT pg_advisory_xact_lock(hashtext('jogos_brasileirao'))"))
+    esquema = inspect(conexao)
+    if not esquema.has_table(JOGOS.name):
+        JOGOS.create(conexao)
+        return
+    if esquema.get_pk_constraint(JOGOS.name)["constrained_columns"]:
+        return
+
+    # A versão anterior criava a tabela com pandas, inferindo tipos sem chave.
+    if postgresql:
+        conexao.execute(text("ALTER TABLE jogos_brasileirao ADD PRIMARY KEY (id_jogo)"))
+        for coluna in esquema.get_columns(JOGOS.name):
+            nome = coluna["name"]
+            if isinstance(JOGOS.c[nome].type, Text) and not isinstance(coluna["type"], Text):
+                # Uma coluna opcional inteiramente vazia podia ser criada como numérica.
+                conexao.execute(text(f"ALTER TABLE jogos_brasileirao ALTER COLUMN {nome} TYPE TEXT"))
+    else:
+        conexao.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_jogos_brasileirao_id "
+            "ON jogos_brasileirao (id_jogo)"
+        ))
+
+
 def carregar(dados, engine, substituir=False):
-    """Grava o recorte em tabela própria, sem afetar a tabela do Titanic."""
+    """Insere ou atualiza o recorte por ID e retorna quantos jogos foram gravados."""
     if dados.empty:
         raise ValueError("O filtro não retornou jogos; nenhuma carga foi feita.")
+    if dados["id_jogo"].isna().any() or dados["id_jogo"].duplicated().any():
+        raise ValueError("A carga exige IDs de jogos preenchidos e únicos.")
+
+    registros = dados.loc[:, COLUNAS_DESEJADAS].astype(object)
+    registros["data"] = dados["data"].dt.date
+    registros = registros.where(registros.notna(), None).to_dict("records")
+    ids = [registro["id_jogo"] for registro in registros]
+    inserir = {"postgresql": inserir_postgresql, "sqlite": inserir_sqlite}[engine.dialect.name]
+    comando = inserir(JOGOS)
+    comando = comando.on_conflict_do_update(
+        index_elements=[JOGOS.c.id_jogo],
+        set_={coluna: comando.excluded[coluna] for coluna in COLUNAS_DESEJADAS[1:]},
+    )
+
     with engine.begin() as conexao:
-        dados.to_sql(
-            "jogos_brasileirao", conexao, index=False, dtype={"data": Date()},
-            if_exists="replace" if substituir else "fail",
+        preparar_tabela(conexao)
+        if substituir:
+            conexao.execute(JOGOS.delete())
+        conexao.execute(comando, registros)
+        total = conexao.scalar(
+            select(func.count()).select_from(JOGOS).where(JOGOS.c.id_jogo.in_(ids))
         )
-        total = conexao.execute(text("SELECT COUNT(*) FROM jogos_brasileirao")).scalar_one()
-        if total != len(dados):
-            raise ValueError("Contagem no banco diferente do DataFrame.")
-    print(f"Carregados {total} jogos na tabela jogos_brasileirao.")
+        if total != len(registros):
+            raise ValueError("Contagem do recorte no banco diferente do DataFrame.")
+    print(f"Gravados {total} jogos do recorte na tabela jogos_brasileirao.")
     return total
 
 
@@ -124,7 +187,10 @@ def main():
     parser.add_argument("--ano", type=int, default=2022, help="Ano civil da partida")
     parser.add_argument("--listar-times", action="store_true")
     parser.add_argument("--carregar", action="store_true", help="Gravar no PostgreSQL")
-    parser.add_argument("--substituir", action="store_true", help="Recriar jogos_brasileirao")
+    parser.add_argument(
+        "--substituir", action="store_true",
+        help="Apagar as partidas anteriores e manter apenas o novo recorte",
+    )
     args = parser.parse_args()
     if args.substituir and not args.carregar:
         parser.error("--substituir exige --carregar")

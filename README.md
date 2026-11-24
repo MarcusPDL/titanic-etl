@@ -156,21 +156,96 @@ Após configurar `.env` e iniciar o PostgreSQL:
 .\.venv\Scripts\python.exe brasileirao.py --origem data/brasileirao_bruto.csv --time Palmeiras --ano 2022 --carregar
 ```
 
-A tabela `jogos_brasileirao` guarda **apenas o recorte selecionado**, com `data` do tipo SQL `DATE`, sem índice adicional do pandas. Uma tabela existente gera erro. Para trocar o recorte, acrescente `--substituir`: isso apaga e recria **somente `jogos_brasileirao`**, sem alterar `passageiros`.
+A carga grava as partidas do **recorte selecionado** em `jogos_brasileirao`. A tabela acumula as partidas de recortes sucessivos. `id_jogo` é a chave primária, `data` usa o tipo SQL `DATE` e `hora` mantém o texto do CSV. Campos opcionais ausentes são gravados como `NULL`. Na primeira carga sobre uma tabela criada pela versão anterior, o PostgreSQL acrescenta a chave primária e preserva as partidas existentes.
+
+O PostgreSQL usa `INSERT ... ON CONFLICT (id_jogo) DO UPDATE` para atualizar uma partida já gravada. Assim, carregar o mesmo recorte de novo ou carregar um adversário que jogou as mesmas partidas mantém uma linha por jogo. A mensagem do script conta os jogos processados no recorte. Para deixar na tabela apenas o novo recorte, acrescente `--substituir`. A exclusão e a carga ficam na mesma transação.
 
 ```sql
 SELECT COUNT(*) AS jogos, MIN(data) AS primeira_partida,
        MAX(data) AS ultima_partida
-FROM jogos_brasileirao;
+FROM jogos_brasileirao
+WHERE ano = 2022 AND (mandante = 'Palmeiras' OR visitante = 'Palmeiras');
 
 SELECT mandante, visitante, gols_mandante, gols_visitante
 FROM jogos_brasileirao
+WHERE ano = 2022 AND (mandante = 'Palmeiras' OR visitante = 'Palmeiras')
 ORDER BY data, id_jogo;
 ```
 
-Os testes desta aula verificam o filtro em ambas as posições, datas, preservação dos dados brutos, entradas inválidas e a escrita SQL com SQLite em memória. Esse teste de SQL não substitui a integração PostgreSQL, que depende de um servidor ativo.
+Com a base da aula, a primeira consulta retorna 38 partidas. Os testes locais usam SQLite em memória e verificam o filtro, a chave primária, a recarga, a sobreposição entre recortes, a compatibilidade com a tabela anterior e a reversão da substituição em caso de falha.
 
-Validação em 28/10/2026: **12 testes passaram** (7 do Brasileirão e 5 do Titanic). Todas as células de código de `brasileirao.ipynb` executaram sem erros com o CSV local e a carga desativada. O resultado didático foi comparado ao da função reutilizável. Como verificação adicional, São Paulo em 2023 retornou 38 partidas e Palmeiras no ano civil 2021 retornou 50, reforçando a diferença entre ano e temporada. O Docker continua sem servidor ativo nesta máquina, portanto a carga PostgreSQL permanece não validada.
+Na validação da transformação em 28/10/2026, o notebook executou com o CSV local e a carga desativada. São Paulo em 2023 retornou 38 partidas e Palmeiras no ano civil 2021 retornou 50.
+
+## Aula 3 — Titanic com CSV e API
+
+Na aula de 24/11/2026, duas fontes complementares descrevem os mesmos passageiros. O CSV fornece nome, sexo, idade, parentes a bordo, bilhete, cabine e porto. A API fornece sobrevivência (`Survived`), classe (`Pclass`) e tarifa (`Fare`). Ambas trazem `PassengerId`, a chave usada para associar cada passageiro independentemente da ordem das linhas.
+
+### Iniciar as fontes locais
+
+Os comandos abaixo pressupõem a pasta `../../fontes_titanic/` com os arquivos e Dockerfiles fornecidos na aula. Ajuste os caminhos dos contextos de build conforme a localização dessa pasta no seu computador. Com o Docker Desktop em execução, rode os comandos na pasta deste exercício. Cada contêiner escuta internamente na porta 8000. As portas 8001 e 8002 do computador permitem acessar os dois serviços em paralelo.
+
+```powershell
+docker build -t titanic-csv ../../fontes_titanic/csv
+docker build -t titanic-api ../../fontes_titanic/api
+docker run -d --rm --name titanic-csv -p 127.0.0.1:8001:8000 titanic-csv
+docker run -d --rm --name titanic-api -p 127.0.0.1:8002:8000 titanic-api
+```
+
+### Integrar e carregar
+
+```powershell
+.\.venv\Scripts\python.exe pipeline.py --api http://localhost:8002/passageiros
+```
+
+Com `--api`, o CSV padrão é `http://localhost:8001/passageiros.csv`. Use `--origem ../../fontes_titanic/csv/passageiros.csv` para ler o arquivo diretamente e manter a consulta à API. O endereço `http://localhost:8002/passageiros/1` consulta um único passageiro. O pipeline usa a rota da coleção e lê a resposta JSON com a biblioteca padrão do Python.
+
+Antes do `merge`, o código verifica se os IDs são inteiros, preenchidos, únicos e correspondem entre as duas fontes. Mesmo com o mesmo número de linhas, duas fontes podem trazer passageiros diferentes. `validate="one_to_one"` reforça a unicidade dos dois lados da junção. O CSV e a API da aula têm 891 passageiros cada. O resultado integrado tem 12 colunas e, após a transformação, 11.
+
+O script grava o CSV integrado em `data/titanic_bruto.csv`, o tratado em `data/titanic_limpo.csv` e o relatório em `data/qualidade.json`. Para gravar também na tabela `passageiros`, prepare o [PostgreSQL](#postgresql) e acrescente `--carregar`. A consulta SQL da Aula 1 também serve para conferir essa carga.
+
+### Revisão da aula
+
+| Conceito | Aplicação no laboratório |
+| --- | --- |
+| Extração | Ler o CSV e pedir à API a lista de passageiros com HTTP GET. |
+| Transformação | Validar chaves, aplicar o INNER JOIN e limpar os dados integrados. |
+| Carregamento | Gravar o resultado em arquivo ou, com `--carregar`, no PostgreSQL. |
+| Status HTTP | 200 indica sucesso, 404 indica recurso ausente e 500 indica erro interno do servidor. |
+| Tipos de JOIN | INNER preserva as correspondências. LEFT preserva as chaves da esquerda, RIGHT as da direita e OUTER as de ambos os lados. |
+| Variável-alvo | `Survived` é o rótulo `y`. Características como classe, sexo e tarifa podem compor `X`. |
+
+## Aula 4 — Treino e teste em SQLite
+
+[O script](titanic_sqlite.py) reaproveita a extração e a integração da Aula 3. Execute na pasta deste exercício. O comando usa o CSV e a API locais e grava os bancos em `data/`.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe titanic_sqlite.py --api http://localhost:8002/passageiros
+```
+
+Para repetir sem Docker, use o CSV completo já salvo pela Aula 1 ou integrado pela Aula 3.
+
+```powershell
+.\.venv\Scripts\python.exe titanic_sqlite.py --origem data/titanic_bruto.csv
+```
+
+O script seleciona classe, sexo, idade, irmãos e cônjuges, pais e filhos e tarifa como características. Codifica sexo como 0 ou 1 e separa `sobreviveu` como alvo. A divisão é de 80% para treino e 20% para teste, com semente 42. Imputação por mediana e padronização aprendem seus parâmetros só no treino para evitar vazamento de dados.
+
+| Banco | Tabelas | Conteúdo |
+| --- | --- | --- |
+| `titanic.db` | `x_treino`, `x_teste`, `y_treino`, `y_teste` | Características tratadas na escala original e seus rótulos. |
+| `titanic_esc.db` | As mesmas quatro tabelas | Características padronizadas com `StandardScaler`, com os mesmos passageiros e rótulos. |
+
+Cada carga substitui as quatro tabelas de um arquivo em uma transação SQLite. Para escolher outra pasta, use `--destino`. Na base da aula, cada arquivo contém **712 passageiros no treino e 179 no teste**. O SQLite grava em arquivo local. A função de leitura ordena as tabelas por `id_passageiro` e confere a correspondência entre as características e os rótulos.
+
+```python
+from titanic_sqlite import ler_sqlite
+
+conjuntos = ler_sqlite("data/titanic_esc.db")
+x_treino, y_treino = conjuntos["x_treino"], conjuntos["y_treino"]
+```
+
+O exercício termina na preparação dos conjuntos. Segundo as anotações, a prova é conceitual e o trabalho final pode ser apresentado pelo notebook, com células Markdown explicando as etapas. O enunciado, os critérios e o prazo exato do trabalho ficaram em aberto no material.
 
 ## Referências
 
